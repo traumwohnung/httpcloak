@@ -770,6 +770,103 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 	return &Session{inner: s, configErr: cfg.configErr}
 }
 
+// NewTransport creates a bare transport.Transport with the same option
+// parsing as NewSession, but without the HTTP-client layer (cookie jar,
+// redirect follower, per-session retry loop).
+//
+// Use this when you need httpcloak's TLS/H2 fingerprinting, connection
+// pooling, and protocol dispatch, but do not want stateful HTTP-client
+// semantics layered on top. The typical case is embedding httpcloak in a
+// forwarding proxy, where client-level state leaks between flows.
+//
+// Session-only options (redirect following, retry, switch-protocol, cookie
+// jar) are silently ignored — they have no meaning at the transport layer.
+// All other options (proxy, timeout, TLS, ECH, custom JA3/Akamai, TCP
+// fingerprint, local address, key log, force-HTTPn, IPv4 preference,
+// speculative TLS, session cache backend, etc.) apply as they do for
+// NewSession.
+//
+// Returns an error only when a custom fingerprint fails to parse.
+func NewTransport(preset string, opts ...SessionOption) (*transport.Transport, error) {
+	cfg := &sessionConfig{
+		preset:  preset,
+		timeout: 30 * time.Second,
+	}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	if cfg.configErr != nil {
+		return nil, cfg.configErr
+	}
+
+	// Build TransportConfig if any non-default transport-level option is set.
+	var tCfg *transport.TransportConfig
+	var keyLogWriter io.WriteCloser
+	if cfg.keyLogFile != "" {
+		w, err := transport.NewKeyLogFileWriter(cfg.keyLogFile)
+		if err == nil {
+			keyLogWriter = w
+		}
+	}
+	needsConfig := len(cfg.connectTo) > 0 || cfg.echConfigDomain != "" || cfg.tlsOnly ||
+		cfg.quicIdleTimeout > 0 || cfg.localAddr != "" || keyLogWriter != nil ||
+		cfg.enableSpeculativeTLS || cfg.sessionCacheBackend != nil ||
+		cfg.customJA3 != "" || cfg.customH2Settings != nil ||
+		len(cfg.customPseudoOrder) > 0 || cfg.customTCPFingerprint != nil
+	if needsConfig {
+		tCfg = &transport.TransportConfig{
+			ConnectTo:                 cfg.connectTo,
+			ECHConfigDomain:           cfg.echConfigDomain,
+			TLSOnly:                   cfg.tlsOnly,
+			QuicIdleTimeout:           cfg.quicIdleTimeout,
+			LocalAddr:                 cfg.localAddr,
+			KeyLogWriter:              keyLogWriter,
+			EnableSpeculativeTLS:      cfg.enableSpeculativeTLS,
+			SessionCacheBackend:       cfg.sessionCacheBackend,
+			SessionCacheErrorCallback: cfg.sessionCacheErrorCallback,
+			CustomJA3:                 cfg.customJA3,
+			CustomJA3Extras:           cfg.customJA3Extras,
+			CustomH2Settings:          cfg.customH2Settings,
+			CustomPseudoOrder:         cfg.customPseudoOrder,
+			CustomTCPFingerprint:      cfg.customTCPFingerprint,
+		}
+	}
+
+	// Build ProxyConfig if any proxy URL is set.
+	var proxy *transport.ProxyConfig
+	if cfg.proxy != "" || cfg.tcpProxy != "" || cfg.udpProxy != "" {
+		proxy = &transport.ProxyConfig{
+			URL:      cfg.proxy,
+			TCPProxy: cfg.tcpProxy,
+			UDPProxy: cfg.udpProxy,
+		}
+	}
+
+	t := transport.NewTransportWithConfig(cfg.preset, proxy, tCfg)
+
+	// Apply post-construction settings (mirrors session.NewSession).
+	if cfg.insecureSkipVerify {
+		t.SetInsecureSkipVerify(true)
+	}
+	switch {
+	case cfg.forceHTTP1:
+		t.SetProtocol(transport.ProtocolHTTP1)
+	case cfg.forceHTTP2:
+		t.SetProtocol(transport.ProtocolHTTP2)
+	case cfg.forceHTTP3:
+		t.SetProtocol(transport.ProtocolHTTP3)
+	}
+	if cfg.preferIPv4 {
+		if dc := t.GetDNSCache(); dc != nil {
+			dc.SetPreferIPv4(true)
+		}
+	}
+	if cfg.disableECH {
+		t.SetDisableECH(true)
+	}
+	return t, nil
+}
+
 // Do executes a request within the session, maintaining cookies
 func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 	if s.configErr != nil {

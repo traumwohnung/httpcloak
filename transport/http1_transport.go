@@ -933,14 +933,14 @@ func (t *HTTP1Transport) dialHTTPProxyBlocking(ctx context.Context, conn net.Con
 		return nil, fmt.Errorf("failed to read CONNECT response: %w", err)
 	}
 
-	// IMPORTANT: Read the body BEFORE closing it, regardless of status. Some
-	// upstream proxies return structured diagnostics in the CONNECT response
-	// body — sticky-session state, rate-limit reason, etc.  Previously we
-	// closed the body then tried to read it, getting nothing.
-	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-	resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
+		// Only read the body on non-200 — a successful CONNECT response has
+		// no body, and io.ReadAll on a Content-Length-less stream blocks
+		// until the peer closes the connection (never, for a live tunnel).
+		// Some upstream proxies include structured diagnostics on error
+		// responses: sticky-session state, rate-limit reason, billing.
+		bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
 		slog.Warn("CONNECT upstream rejected",
 			"target", targetLine,
 			"sticky", stickyID,
@@ -949,13 +949,14 @@ func (t *HTTP1Transport) dialHTTPProxyBlocking(ctx context.Context, conn net.Con
 			"elapsed_ms", time.Since(connectStart).Milliseconds(),
 			"body_len", len(bodyPreview),
 			"body", truncateForLog(bodyPreview, 512),
-			"proxy_headers", selectHeaders(resp.Header, "X-", "Via", "Server", "Retry-After", "X-Pio-", "X-ProxyingIO-"))
+			"proxy_headers", selectHeaders(resp.Header, "X-", "Via", "Server", "Retry-After"))
 		conn.Close()
 		if len(bodyPreview) > 0 {
 			return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, strings.TrimSpace(string(bodyPreview)))
 		}
 		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
 	}
+	resp.Body.Close()
 
 	slog.Debug("CONNECT ok",
 		"target", targetLine, "sticky", stickyID,
