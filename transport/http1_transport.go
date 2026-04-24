@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	http "github.com/sardanioss/http"
 	"net/textproto"
@@ -177,37 +178,70 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	connectHost := t.getConnectHost(host)
 	key := fmt.Sprintf("%s://%s:%s", scheme, connectHost, port)
 
-	// Try to get an idle connection
+	// Try to get an idle connection.
+	//
+	// IMPORTANT: when a pooled connection is returned but the request on it
+	// fails (server/upstream-proxy closed our tunnel), we do NOT silently dial
+	// a fresh connection. Fresh dials go through CONNECT to the upstream
+	// proxy, which may re-run sticky-session lookup and land on a different
+	// exit IP. For flows whose state is bound to the originating IP, a
+	// transparent reconnect silently invalidates downstream state — worse
+	// than a hard failure. Callers who want retry must implement it with
+	// full awareness of idempotency and IP affinity.
 	conn, err := t.getIdleConn(key)
 	if err == nil && conn != nil {
+		slog.Debug("h1 using pooled conn",
+			"target", key, "method", req.Method, "path", req.URL.Path,
+			"conn_age_s", int(time.Since(conn.createdAt).Seconds()),
+			"conn_idle_s", int(time.Since(conn.lastUsedAt).Seconds()),
+			"use_count", conn.useCount)
 		resp, err := t.doRequest(conn, req)
 		if err == nil {
 			// Wrap the body to handle connection lifecycle
 			// Connection will be returned to pool or closed when body is fully read
+			keepAlive := t.shouldKeepAlive(req, resp)
+			slog.Debug("h1 pooled request success",
+				"target", key, "method", req.Method, "path", req.URL.Path,
+				"status", resp.StatusCode, "will_keep_alive", keepAlive,
+				"resp_connection_hdr", resp.Header.Get("Connection"))
 			resp.Body = &pooledBodyWrapper{
 				body:        resp.Body,
 				conn:        conn,
 				key:         key,
 				transport:   t,
-				keepAlive:   t.shouldKeepAlive(req, resp),
+				keepAlive:   keepAlive,
 			}
 			return resp, nil
 		}
-		// Connection failed, close it and try new one
+		slog.Warn("h1 pooled request failed — NOT retrying on fresh conn",
+			"target", key, "method", req.Method, "path", req.URL.Path,
+			"err", err)
 		conn.close()
+		return nil, WrapError("pooled_request", host, port, "h1", err)
 	}
 
-	// Create new connection (pass request host for SNI, connectHost used internally for DNS)
+	// No pooled connection — this is the first request on this key (or the
+	// previously pooled conn was already evicted by the cleanup loop). Open
+	// a fresh upstream tunnel.
+	slog.Debug("h1 pool miss — dialing fresh",
+		"target", key, "method", req.Method, "path", req.URL.Path)
 	conn, err = t.createConn(req.Context(), host, port, scheme)
 	if err != nil {
+		slog.Warn("h1 fresh createConn failed",
+			"target", key, "method", req.Method, "path", req.URL.Path, "err", err)
 		return nil, err
 	}
 
 	resp, err := t.doRequest(conn, req)
 	if err != nil {
+		slog.Warn("h1 fresh doRequest failed",
+			"target", key, "method", req.Method, "path", req.URL.Path, "err", err)
 		conn.close()
 		return nil, WrapError("request", host, port, "h1", err)
 	}
+	slog.Debug("h1 fresh request success",
+		"target", key, "method", req.Method, "path", req.URL.Path,
+		"status", resp.StatusCode)
 
 	// Wrap the body to handle connection lifecycle
 	resp.Body = &pooledBodyWrapper{
@@ -391,7 +425,14 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 	targetAddr := net.JoinHostPort(connectHost, port)
 
 	if t.proxy != nil && t.proxy.URL != "" {
-		rawConn, err = t.dialThroughProxy(ctx, connectHost, port)
+		// Retry the CONNECT handshake a few times. Unlike retrying an inner
+		// HTTP request, retrying the CONNECT itself is always safe for target
+		// state — the target server sees no bytes during CONNECT, so a
+		// duplicate CONNECT never causes duplicate delivery. And because we
+		// reuse the same proxy credentials (and thus the same sticky-session
+		// identifier on the upstream proxy), a retry should land on the same
+		// exit IP if the provider honors sticky affinity.
+		rawConn, err = t.dialThroughProxyWithRetry(ctx, connectHost, port)
 		if err != nil {
 			return nil, NewProxyError("dial_proxy", host, port, err)
 		}
@@ -617,6 +658,86 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 	return conn, nil
 }
 
+// dialThroughProxyWithRetry wraps dialThroughProxy with a small retry loop
+// for transient upstream-proxy failures. Because the CONNECT handshake never
+// exposes bytes to the target server, retrying is always safe for target
+// state (single-use tokens, auth handshakes, etc.) — unlike retrying an
+// inner HTTP request. Providers with sticky-session affinity should return
+// the same exit IP on a retry since the same credentials (and thus same
+// sticky identifier) are used.
+//
+// We retry on:
+//   - HTTP 5xx responses from the upstream proxy (transient provider errors)
+//   - Network timeouts / connection resets during the CONNECT exchange
+//
+// We do NOT retry on:
+//   - HTTP 407 (auth failure — won't recover)
+//   - HTTP 403 (forbidden — won't recover)
+//   - Permanent DNS or dial failures to the proxy itself
+func (t *HTTP1Transport) dialThroughProxyWithRetry(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
+	const maxAttempts = 3
+	const baseDelay = 200 * time.Millisecond
+
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			slog.Warn("CONNECT upstream proxy retry",
+				"target", targetHost+":"+targetPort,
+				"attempt", attempt+1,
+				"max", maxAttempts,
+				"prev_err", lastErr)
+			select {
+			case <-time.After(baseDelay << (attempt - 1)):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		conn, err := t.dialThroughProxy(ctx, targetHost, targetPort)
+		if err == nil {
+			if attempt > 0 {
+				slog.Info("CONNECT upstream proxy recovered on retry",
+					"target", targetHost+":"+targetPort,
+					"attempt", attempt+1)
+			}
+			return conn, nil
+		}
+		lastErr = err
+		if !isCONNECTRetryable(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// isCONNECTRetryable reports whether a CONNECT-phase error is worth retrying
+// with the same proxy credentials. Matches by substring on the error string
+// because the CONNECT path surfaces plain fmt.Errorf errors.
+func isCONNECTRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Auth and authz failures — retry won't help.
+	if strings.Contains(msg, "407") || strings.Contains(msg, "403") {
+		return false
+	}
+	// Provider-side transient errors that may clear on retry.
+	if strings.Contains(msg, "500") ||
+		strings.Contains(msg, "502") ||
+		strings.Contains(msg, "503") ||
+		strings.Contains(msg, "504") {
+		return true
+	}
+	// Network-level transient errors during the CONNECT exchange.
+	if strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "EOF") {
+		return true
+	}
+	return false
+}
+
 // dialThroughProxy establishes a connection through a proxy
 // Supports both HTTP proxies (HTTP CONNECT) and SOCKS5 proxies (SOCKS5 CONNECT)
 func (t *HTTP1Transport) dialThroughProxy(ctx context.Context, targetHost, targetPort string) (net.Conn, error) {
@@ -749,7 +870,9 @@ func (t *HTTP1Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetH
 		Timeout:   t.connectTimeout,
 		KeepAlive: 30 * time.Second,
 	}
-	SetDialerControl(dialer, &t.preset.TCPFingerprint)
+	// Do NOT apply TCP fingerprint to the proxy connection — the fingerprint
+	// should only be applied to the target TLS connection. Applying it to the
+	// proxy causes some providers to reject the CONNECT with 500.
 	if t.localAddr != "" {
 		dialer.LocalAddr = &net.TCPAddr{IP: net.ParseIP(t.localAddr)}
 	}
@@ -775,8 +898,19 @@ func (t *HTTP1Transport) dialHTTPProxyBlockingFresh(ctx context.Context, targetH
 // dialHTTPProxyBlocking performs the traditional blocking CONNECT flow.
 // Used when speculative TLS is disabled or as a fallback.
 func (t *HTTP1Transport) dialHTTPProxyBlocking(ctx context.Context, conn net.Conn, connectReq string) (net.Conn, error) {
+	connectStart := time.Now()
+	stickyID := extractStickySessionID(connectReq)
+	targetLine := firstLine(connectReq)
+
+	slog.Debug("CONNECT send",
+		"target", targetLine,
+		"sticky", stickyID,
+		"proxy_remote", conn.RemoteAddr().String())
+
 	// Send CONNECT request
 	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		slog.Warn("CONNECT write failed",
+			"target", targetLine, "sticky", stickyID, "err", err)
 		conn.Close()
 		return nil, fmt.Errorf("failed to send CONNECT request: %w", err)
 	}
@@ -791,15 +925,42 @@ func (t *HTTP1Transport) dialHTTPProxyBlocking(ctx context.Context, conn net.Con
 	resp, err := http.ReadResponse(br, nil)
 	conn.SetReadDeadline(time.Time{}) // Clear deadline after response
 	if err != nil {
+		slog.Warn("CONNECT read response failed",
+			"target", targetLine, "sticky", stickyID,
+			"elapsed_ms", time.Since(connectStart).Milliseconds(),
+			"err", err)
 		conn.Close()
 		return nil, fmt.Errorf("failed to read CONNECT response: %w", err)
 	}
+
+	// IMPORTANT: Read the body BEFORE closing it, regardless of status. Some
+	// upstream proxies return structured diagnostics in the CONNECT response
+	// body — sticky-session state, rate-limit reason, etc.  Previously we
+	// closed the body then tried to read it, getting nothing.
+	bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		slog.Warn("CONNECT upstream rejected",
+			"target", targetLine,
+			"sticky", stickyID,
+			"status", resp.Status,
+			"proxy_remote", conn.RemoteAddr().String(),
+			"elapsed_ms", time.Since(connectStart).Milliseconds(),
+			"body_len", len(bodyPreview),
+			"body", truncateForLog(bodyPreview, 512),
+			"proxy_headers", selectHeaders(resp.Header, "X-", "Via", "Server", "Retry-After", "X-Pio-", "X-ProxyingIO-"))
 		conn.Close()
+		if len(bodyPreview) > 0 {
+			return nil, fmt.Errorf("proxy CONNECT failed: %s: %s", resp.Status, strings.TrimSpace(string(bodyPreview)))
+		}
 		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
 	}
+
+	slog.Debug("CONNECT ok",
+		"target", targetLine, "sticky", stickyID,
+		"elapsed_ms", time.Since(connectStart).Milliseconds(),
+		"proxy_remote", conn.RemoteAddr().String())
 
 	// If the bufio.Reader read ahead past the HTTP response (e.g., start of
 	// TLS ServerHello arrived in same TCP segment), wrap the conn so those
@@ -809,6 +970,77 @@ func (t *HTTP1Transport) dialHTTPProxyBlocking(ctx context.Context, conn net.Con
 		return &bufferedConn{Conn: conn, r: io.MultiReader(br, conn)}, nil
 	}
 	return conn, nil
+}
+
+// extractStickySessionID pulls the "session-XXXX" token out of a
+// Proxy-Authorization Basic header, if present. This lets us correlate log
+// lines with specific sticky sessions on upstream proxies that encode the
+// session identifier in credentials. Returns empty string if we can't find
+// one (direct conn, non-sticky provider, etc).
+func extractStickySessionID(connectReq string) string {
+	i := strings.Index(connectReq, "Proxy-Authorization: Basic ")
+	if i < 0 {
+		return ""
+	}
+	rest := connectReq[i+len("Proxy-Authorization: Basic "):]
+	j := strings.Index(rest, "\r\n")
+	if j < 0 {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(rest[:j])
+	if err != nil {
+		return ""
+	}
+	s := string(decoded)
+	// Format user:password — session-XXXX is in the password section.
+	colon := strings.Index(s, ":")
+	if colon < 0 {
+		return ""
+	}
+	pw := s[colon+1:]
+	// Look for `session-<id>_...` token.
+	if k := strings.Index(pw, "session-"); k >= 0 {
+		tail := pw[k:]
+		end := strings.IndexAny(tail, "_ \t")
+		if end < 0 {
+			end = len(tail)
+		}
+		return tail[:end]
+	}
+	return ""
+}
+
+func firstLine(s string) string {
+	if i := strings.Index(s, "\r\n"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+func truncateForLog(b []byte, max int) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > max {
+		return s[:max] + "…"
+	}
+	return s
+}
+
+// selectHeaders returns a flat string of headers whose name matches any of
+// the provided prefixes. Useful for logging provider-specific diagnostic
+// headers without dumping the entire header map.
+func selectHeaders(h http.Header, prefixes ...string) string {
+	var parts []string
+	for k, vs := range h {
+		for _, pfx := range prefixes {
+			if strings.HasPrefix(strings.ToLower(k), strings.ToLower(pfx)) || strings.EqualFold(k, pfx) {
+				for _, v := range vs {
+					parts = append(parts, k+"="+v)
+				}
+				break
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // bufferedConn wraps a net.Conn to first drain any bytes buffered by a

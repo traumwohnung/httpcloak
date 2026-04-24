@@ -197,11 +197,29 @@ type Response struct {
 	bodyRead  bool
 }
 
-// Close closes the response body.
+// Close closes the response body and cancels the session context.
 func (r *Response) Close() error {
 	if r.Body != nil {
 		return r.Body.Close()
 	}
+	return nil
+}
+
+// CloseBody closes just the response body without canceling the session context.
+// This frees the H2 stream / H1 connection for reuse while keeping the session
+// alive for subsequent requests. Call after fully reading the body.
+func (r *Response) CloseBody() error {
+	if r.Body == nil {
+		return nil
+	}
+	type bodyCloser interface {
+		CloseBody() error
+	}
+	if bc, ok := r.Body.(bodyCloser); ok {
+		return bc.CloseBody()
+	}
+	// Body doesn't implement CloseBody — don't call Close() as it would
+	// cancel the session context. The body was already drained by Bytes().
 	return nil
 }
 
@@ -219,7 +237,9 @@ func (r *Response) Bytes() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Body.Close()
+	// Use CloseBody (not Close) to avoid canceling the session context.
+	// This allows the session to be reused for subsequent requests.
+	r.CloseBody()
 	r.bodyBytes = data
 	r.bodyRead = true
 	return data, nil

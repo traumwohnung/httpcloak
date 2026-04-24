@@ -43,11 +43,26 @@ func (r *StreamResponse) Read(p []byte) (n int, err error) {
 	return r.reader.Read(p)
 }
 
-// Close closes the response body and cancels the context
+// Close closes the response body and cancels the context.
+// Use CloseBody() instead if you intend to reuse the session for more requests.
 func (r *StreamResponse) Close() error {
 	if r.cancel != nil {
 		r.cancel()
 	}
+	return r.closeBody()
+}
+
+// CloseBody closes just the response body (decompressor + raw reader) without
+// canceling the per-request context. This frees the H2 stream or H1 connection
+// for reuse while keeping the session alive for subsequent requests.
+//
+// Call this after fully reading the body (io.ReadAll or reading to EOF).
+// Call Close() only when tearing down the session entirely.
+func (r *StreamResponse) CloseBody() error {
+	return r.closeBody()
+}
+
+func (r *StreamResponse) closeBody() error {
 	if r.decompressor != nil {
 		r.decompressor.Close()
 	}
