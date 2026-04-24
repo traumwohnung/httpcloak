@@ -260,10 +260,35 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // allowing the TLS connection to be reused instead of creating a new one.
 // The connection will be closed after the request (not pooled) since it came from H2 transport.
 func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.UConn, host, port string) (*http.Response, error) {
+	return t.roundTripOnTLSConn(req, tlsConn, host, port, true)
+}
+
+// RoundTripOnConn performs an HTTP/1.1 request on a TLS connection whose
+// lifecycle is owned by the caller. The connection is NOT closed after the
+// response, and it is NOT added to this transport's pool. The caller must
+// ensure only one request is in flight on this conn at a time (HTTP/1.1 is
+// not multiplexed) and must close the conn eventually.
+//
+// The response body is a thin non-closing wrapper: reading it drains the HTTP
+// body from the underlying conn; closing it drains any remaining body bytes
+// (preserving HTTP framing for the next request) but leaves the TCP
+// connection open. Callers MUST close the returned body before issuing the
+// next request on this conn, or the next response's framing will be
+// misparsed.
+func (t *HTTP1Transport) RoundTripOnConn(req *http.Request, tlsConn *utls.UConn, host, port string) (*http.Response, error) {
+	return t.roundTripOnTLSConn(req, tlsConn, host, port, false)
+}
+
+// roundTripOnTLSConn is the shared implementation for RoundTripWithTLSConn
+// and RoundTripOnConn. closeOnDone controls whether the underlying TCP
+// connection is closed when the response body is closed.
+func (t *HTTP1Transport) roundTripOnTLSConn(req *http.Request, tlsConn *utls.UConn, host, port string, closeOnDone bool) (*http.Response, error) {
 	t.closedMu.RLock()
 	if t.closed {
 		t.closedMu.RUnlock()
-		tlsConn.Close()
+		if closeOnDone {
+			tlsConn.Close()
+		}
 		return nil, &TransportError{
 			Op:       "roundtrip_with_conn",
 			Host:     host,
@@ -288,16 +313,22 @@ func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.U
 
 	resp, err := t.doRequest(conn, req)
 	if err != nil {
-		conn.close()
+		if closeOnDone {
+			conn.close()
+		}
 		return nil, WrapError("request", host, port, "h1", err)
 	}
 
-	// Wrap the body to close connection when done (not pooled since it came from H2 attempt)
-	resp.Body = &streamBodyWrapper{
-		body: resp.Body,
-		conn: conn,
+	if closeOnDone {
+		// Legacy behavior: close the conn when the body is closed. Used
+		// when ALPN negotiated HTTP/1.1 on a conn the H2 transport dialed
+		// and the conn isn't reused.
+		resp.Body = &streamBodyWrapper{body: resp.Body, conn: conn}
+	} else {
+		// Caller owns conn lifecycle. Closing the body drains the HTTP
+		// body for framing correctness but leaves the TCP conn open.
+		resp.Body = &drainOnlyBodyWrapper{body: resp.Body}
 	}
-
 	return resp, nil
 }
 
@@ -347,6 +378,25 @@ func (w *pooledBodyWrapper) handleClose() {
 			w.conn.close()
 		}
 	})
+}
+
+// drainOnlyBodyWrapper wraps a response body so that Close() drains the
+// remaining HTTP body (preserving framing for the next request) without
+// touching the underlying TCP connection. Used by RoundTripOnConn where
+// the connection lifecycle is owned by the caller.
+type drainOnlyBodyWrapper struct {
+	body io.ReadCloser
+}
+
+func (w *drainOnlyBodyWrapper) Read(p []byte) (n int, err error) {
+	return w.body.Read(p)
+}
+
+func (w *drainOnlyBodyWrapper) Close() error {
+	// Close() on Go's *http.body drains up to the content-length or
+	// chunked terminator, leaving the bufio.Reader positioned at the start
+	// of the next response. Do not touch the conn.
+	return w.body.Close()
 }
 
 // streamBodyWrapper wraps response body to close connection when body is closed

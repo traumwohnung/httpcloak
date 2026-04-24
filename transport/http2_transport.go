@@ -75,6 +75,154 @@ type persistentConn struct {
 	mu              sync.Mutex
 }
 
+// buildH2Transport constructs a *http2.Transport wired with the preset's
+// fingerprint-sensitive settings: SETTINGS frame values + order,
+// WINDOW_UPDATE, PRIORITY mode, pseudo-header order, HPACK policy, and
+// UserAgent. Shared by createConn (pool-owned path) and
+// NewClientConnOnConn (caller-owned path) so both produce byte-equivalent
+// H2 framing on the wire.
+func (t *HTTP2Transport) buildH2Transport() *http2.Transport {
+	settings := t.preset.HTTP2Settings
+	tlsOnly := t.config != nil && t.config.TLSOnly
+	userAgent := t.preset.UserAgent
+	if tlsOnly {
+		userAgent = "" // Don't set default User-Agent in TLS-only mode
+	}
+
+	h2Settings := map[http2.SettingID]uint32{
+		http2.SettingHeaderTableSize:   settings.HeaderTableSize,
+		http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
+		http2.SettingInitialWindowSize: settings.InitialWindowSize,
+		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
+	}
+	h2SettingsOrder := []http2.SettingID{
+		http2.SettingHeaderTableSize,
+		http2.SettingEnablePush,
+		http2.SettingInitialWindowSize,
+		http2.SettingMaxHeaderListSize,
+	}
+	if settings.MaxConcurrentStreams > 0 {
+		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
+	}
+	if settings.MaxFrameSize > 0 {
+		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
+	}
+	if settings.NoRFC7540Priorities {
+		h2Settings[http2.SettingNoRFC7540Priorities] = 1
+		h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
+	}
+
+	// Pseudo-header order: use custom (Akamai), or browser-type heuristic
+	pseudoOrder := []string{":method", ":authority", ":scheme", ":path"} // Chrome default
+	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
+		pseudoOrder = t.config.CustomPseudoOrder
+	} else if settings.NoRFC7540Priorities {
+		pseudoOrder = []string{":method", ":scheme", ":path", ":authority"} // Safari order
+	}
+
+	return &http2.Transport{
+		AllowHTTP:                  false,
+		DisableCompression:         tlsOnly,
+		StrictMaxConcurrentStreams: false,
+		ReadIdleTimeout:            t.maxIdleTime,
+		PingTimeout:                15 * time.Second,
+
+		// Native fingerprinting via sardanioss/net
+		ConnectionFlow:     settings.ConnectionWindowUpdate,
+		Settings:           h2Settings,
+		SettingsOrder:      h2SettingsOrder,
+		DisableCookieSplit: true, // Chrome sends cookies as one HPACK entry, not split per RFC 9113
+		PseudoHeaderOrder:  pseudoOrder,
+		HeaderPriority: func() *http2.PriorityParam {
+			// Chrome 120+ uses RFC 9218 extensible priorities (priority: header)
+			// instead of RFC 7540 PRIORITY frames. StreamWeight=0 means no PRIORITY data.
+			if settings.StreamWeight > 0 {
+				return &http2.PriorityParam{
+					Weight:    uint8(settings.StreamWeight - 1), // Wire format is weight-1
+					Exclusive: settings.StreamExclusive,
+					StreamDep: 0,
+				}
+			}
+			return nil
+		}(),
+		HeaderOrder: []string{
+			// Chrome 143 header order (verified via tls.peet.ws)
+			"cache-control", // appears on reload/session resumption
+			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+			"upgrade-insecure-requests", "user-agent",
+			"content-type", "content-length", // for POST requests
+			"accept", "origin", // origin for CORS
+			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
+			"referer",
+			"accept-encoding", "accept-language",
+			"cookie", "priority",
+		},
+		UserAgent:           userAgent,
+		StreamPriorityMode:  http2.StreamPriorityChrome,
+		HPACKIndexingPolicy: hpack.IndexingChrome,
+		HPACKNeverIndex:     []string{"cookie", "authorization", "proxy-authorization"},
+	}
+}
+
+// H2ClientConn is an HTTP/2 client over a caller-owned TLS connection.
+// Lifecycle is entirely the caller's: no pool, no silent reconnection on
+// failure. Call Close when done.
+//
+// Suitable for forwarding proxies that want to bind one upstream H2
+// connection to one client tunnel for the whole flow's lifetime — so there
+// is exactly one CONNECT to the upstream residential proxy and one
+// sticky-session lookup per tunnel. Obtained via
+// HTTP2Transport.NewClientConnOnConn or Transport.NewH2ClientConn.
+type H2ClientConn struct {
+	tlsConn *utls.UConn
+	h2Conn  *http2.ClientConn
+}
+
+// TLSConn returns the underlying TLS connection. For diagnostics only —
+// callers must not read from or write to it directly while H2 traffic is
+// in flight.
+func (c *H2ClientConn) TLSConn() *utls.UConn { return c.tlsConn }
+
+// ClientConn returns the underlying *http2.ClientConn so callers can
+// issue requests via RoundTrip. Exposed because the higher-level
+// Transport.DoOnH2Conn helper uses this to run preset-aware requests.
+func (c *H2ClientConn) ClientConn() *http2.ClientConn { return c.h2Conn }
+
+// Close tears down the H2 session and closes the underlying TLS conn.
+// Idempotent.
+func (c *H2ClientConn) Close() error {
+	if c.h2Conn != nil {
+		_ = c.h2Conn.Close()
+	}
+	if c.tlsConn != nil {
+		return c.tlsConn.Close()
+	}
+	return nil
+}
+
+// NewClientConnOnConn builds an H2 client on a TLS connection that has
+// already completed its handshake with ALPN == "h2". Applies all
+// preset-level fingerprint settings (SETTINGS, WINDOW_UPDATE, PRIORITY,
+// HPACK order, header order). The returned H2ClientConn owns the passed
+// tlsConn — callers must not close tlsConn themselves; call
+// H2ClientConn.Close instead.
+//
+// Returns an error if ALPN is not "h2" on the passed conn.
+func (t *HTTP2Transport) NewClientConnOnConn(ctx context.Context, tlsConn *utls.UConn) (*H2ClientConn, error) {
+	state := tlsConn.ConnectionState()
+	if state.NegotiatedProtocol != "h2" {
+		return nil, fmt.Errorf("H2ClientConn: ALPN is %q, want %q", state.NegotiatedProtocol, "h2")
+	}
+	h2Transport := t.buildH2Transport()
+	h2Conn, err := h2Transport.NewClientConn(tlsConn)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP/2 setup failed: %w", err)
+	}
+	return &H2ClientConn{tlsConn: tlsConn, h2Conn: h2Conn}, nil
+}
+
 // NewHTTP2Transport creates a new HTTP/2 transport with uTLS
 func NewHTTP2Transport(preset *fingerprint.Preset, dnsCache *dns.Cache) *HTTP2Transport {
 	return NewHTTP2TransportWithProxy(preset, dnsCache, nil)
@@ -564,94 +712,7 @@ alpnCheck:
 		}
 	}
 
-	// Build HTTP/2 settings from preset
-	settings := t.preset.HTTP2Settings
-
-	// Check TLSOnly mode - disables automatic compression and user-agent
-	tlsOnly := t.config != nil && t.config.TLSOnly
-	userAgent := t.preset.UserAgent
-	if tlsOnly {
-		userAgent = "" // Don't set default User-Agent in TLS-only mode
-	}
-
-	// Build SETTINGS map and order dynamically to include all non-zero settings
-	h2Settings := map[http2.SettingID]uint32{
-		http2.SettingHeaderTableSize:   settings.HeaderTableSize,
-		http2.SettingEnablePush:        boolToUint32(settings.EnablePush),
-		http2.SettingInitialWindowSize: settings.InitialWindowSize,
-		http2.SettingMaxHeaderListSize: settings.MaxHeaderListSize,
-	}
-	h2SettingsOrder := []http2.SettingID{
-		http2.SettingHeaderTableSize,
-		http2.SettingEnablePush,
-		http2.SettingInitialWindowSize,
-		http2.SettingMaxHeaderListSize,
-	}
-	if settings.MaxConcurrentStreams > 0 {
-		h2Settings[http2.SettingMaxConcurrentStreams] = settings.MaxConcurrentStreams
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxConcurrentStreams)
-	}
-	if settings.MaxFrameSize > 0 {
-		h2Settings[http2.SettingMaxFrameSize] = settings.MaxFrameSize
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingMaxFrameSize)
-	}
-	if settings.NoRFC7540Priorities {
-		h2Settings[http2.SettingNoRFC7540Priorities] = 1
-		h2SettingsOrder = append(h2SettingsOrder, http2.SettingNoRFC7540Priorities)
-	}
-
-	// Pseudo-header order: use custom (Akamai), or browser-type heuristic
-	pseudoOrder := []string{":method", ":authority", ":scheme", ":path"} // Chrome default
-	if t.config != nil && len(t.config.CustomPseudoOrder) > 0 {
-		pseudoOrder = t.config.CustomPseudoOrder
-	} else if settings.NoRFC7540Priorities {
-		pseudoOrder = []string{":method", ":scheme", ":path", ":authority"} // Safari order
-	}
-
-	// Create HTTP/2 transport with native fingerprinting (no frame interception needed)
-	h2Transport := &http2.Transport{
-		AllowHTTP:                  false,
-		DisableCompression:         tlsOnly, // Disable auto Accept-Encoding in TLS-only mode
-		StrictMaxConcurrentStreams: false,
-		ReadIdleTimeout:            t.maxIdleTime,
-		PingTimeout:                15 * time.Second,
-
-		// Native fingerprinting via sardanioss/net
-		ConnectionFlow:     settings.ConnectionWindowUpdate,
-		Settings:           h2Settings,
-		SettingsOrder:      h2SettingsOrder,
-		DisableCookieSplit: true, // Chrome sends cookies as one HPACK entry, not split per RFC 9113
-		PseudoHeaderOrder: pseudoOrder,
-		HeaderPriority: func() *http2.PriorityParam {
-			// Chrome 120+ uses RFC 9218 extensible priorities (priority: header)
-			// instead of RFC 7540 PRIORITY frames. StreamWeight=0 means no PRIORITY data.
-			if settings.StreamWeight > 0 {
-				return &http2.PriorityParam{
-					Weight:    uint8(settings.StreamWeight - 1), // Wire format is weight-1
-					Exclusive: settings.StreamExclusive,
-					StreamDep: 0,
-				}
-			}
-			return nil
-		}(),
-		HeaderOrder: []string{
-			// Chrome 143 header order (verified via tls.peet.ws)
-			"cache-control", // appears on reload/session resumption
-			"sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
-			"upgrade-insecure-requests", "user-agent",
-			"content-type", "content-length", // for POST requests
-			"accept", "origin", // origin for CORS
-			"sec-fetch-site", "sec-fetch-mode", "sec-fetch-user", "sec-fetch-dest",
-			"referer",
-			"accept-encoding", "accept-language",
-			"cookie", "priority",
-		},
-		UserAgent:           userAgent,
-		StreamPriorityMode:  http2.StreamPriorityChrome,
-		HPACKIndexingPolicy: hpack.IndexingChrome,
-		HPACKNeverIndex:     []string{"cookie", "authorization", "proxy-authorization"},
-	}
-
+	h2Transport := t.buildH2Transport()
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()

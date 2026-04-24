@@ -19,6 +19,7 @@ import (
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
+	utls "github.com/sardanioss/utls"
 )
 
 // Protocol represents the HTTP protocol version
@@ -1974,4 +1975,170 @@ func decompress(data []byte, encoding string) ([]byte, error) {
 	default:
 		return data, nil
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Owned-connection entry points (forwarding-proxy support)
+//
+// These methods let a caller run requests on a TLS connection whose lifecycle
+// they own, bypassing the transport's connection pool and silent-reconnect
+// logic. The preset's TLS/H2 fingerprint and request-header ordering still
+// apply — only connection management changes.
+//
+// Typical use case: a MITM forwarding proxy that wants exactly one upstream
+// connection per client tunnel so sticky-IP affinity at the upstream proxy
+// cannot drift, and so a failed request cannot be silently retried on a new
+// sticky-session lookup.
+// ----------------------------------------------------------------------------
+
+// NewH2ClientConn is a convenience wrapper around
+// HTTP2Transport.NewClientConnOnConn. Use with DoOnH2Conn to issue requests
+// on the returned H2ClientConn.
+func (t *Transport) NewH2ClientConn(ctx context.Context, tlsConn *utls.UConn) (*H2ClientConn, error) {
+	if t.h2Transport == nil {
+		return nil, fmt.Errorf("transport: HTTP/2 subsystem not initialised")
+	}
+	return t.h2Transport.NewClientConnOnConn(ctx, tlsConn)
+}
+
+// DoOnH2Conn runs one request on a caller-owned H2ClientConn. Applies the
+// preset's header ordering and User-Agent, reads+decompresses the response
+// body, and returns a *Response just like Do. Connection lifecycle is the
+// caller's — on error we do not close or silently redial.
+func (t *Transport) DoOnH2Conn(ctx context.Context, req *Request, h2c *H2ClientConn) (*Response, error) {
+	if h2c == nil || h2c.h2Conn == nil {
+		return nil, fmt.Errorf("transport: DoOnH2Conn called with nil H2ClientConn")
+	}
+	return t.doOnRoundTripper(ctx, req, "h2", func(httpReq *http.Request) (*http.Response, error) {
+		return h2c.h2Conn.RoundTrip(httpReq)
+	})
+}
+
+// DoOnTLSConn runs one HTTP/1.1 request on a caller-owned TLS connection.
+// The TLS conn must have completed its handshake with ALPN == "http/1.1".
+// Behaves like DoOnH2Conn otherwise: preset headers applied, response body
+// read+decompressed, no pool, no silent redial on failure.
+//
+// Caller must serialize requests on this conn (HTTP/1.1 is not multiplexed).
+func (t *Transport) DoOnTLSConn(ctx context.Context, req *Request, tlsConn *utls.UConn) (*Response, error) {
+	if t.h1Transport == nil {
+		return nil, fmt.Errorf("transport: HTTP/1.1 subsystem not initialised")
+	}
+	if tlsConn == nil {
+		return nil, fmt.Errorf("transport: DoOnTLSConn called with nil TLS conn")
+	}
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, NewRequestError("parse_url", "", "", "h1", err)
+	}
+	host := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		port = "443"
+	}
+	return t.doOnRoundTripper(ctx, req, "h1", func(httpReq *http.Request) (*http.Response, error) {
+		return t.h1Transport.RoundTripOnConn(httpReq, tlsConn, host, port)
+	})
+}
+
+// doOnRoundTripper is the shared body of DoOnH2Conn and DoOnTLSConn — and
+// conceptually of doHTTP1/doHTTP2 though those are kept separate for now so
+// this refactor stays minimal. Applies preset headers, runs the supplied
+// roundTripper, reads and decompresses the response.
+func (t *Transport) doOnRoundTripper(ctx context.Context, req *Request, proto string, roundTripper func(*http.Request) (*http.Response, error)) (*Response, error) {
+	startTime := time.Now()
+	timing := &protocol.Timing{}
+
+	parsedURL, err := url.Parse(req.URL)
+	if err != nil {
+		return nil, NewRequestError("parse_url", "", "", proto, err)
+	}
+	host := parsedURL.Hostname()
+	port := parsedURL.Port()
+	if port == "" {
+		if parsedURL.Scheme == "http" {
+			port = "80"
+		} else {
+			port = "443"
+		}
+	}
+
+	timeout := t.timeout
+	if req.Timeout > 0 {
+		timeout = req.Timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	method := req.Method
+	if method == "" {
+		method = "GET"
+	}
+
+	var bodyReader io.Reader
+	if req.BodyReader != nil {
+		bodyReader = req.BodyReader
+	} else if len(req.Body) > 0 {
+		bodyReader = bytes.NewReader(req.Body)
+	} else if method == "POST" || method == "PUT" || method == "PATCH" {
+		bodyReader = bytes.NewReader([]byte{})
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
+	if err != nil {
+		return nil, NewRequestError("create_request", host, port, proto, err)
+	}
+
+	effectiveTLSOnly := t.tlsOnly
+	if req.TLSOnly != nil {
+		effectiveTLSOnly = *req.TLSOnly
+	}
+	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, proto, req.Headers)
+	for key, values := range req.Headers {
+		for i, value := range values {
+			if i == 0 {
+				httpReq.Header.Set(key, value)
+			} else {
+				httpReq.Header.Add(key, value)
+			}
+		}
+	}
+
+	reqStart := time.Now()
+	resp, err := roundTripper(httpReq)
+	if err != nil {
+		return nil, WrapError("roundtrip", host, port, proto, err)
+	}
+	defer resp.Body.Close()
+	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+
+	body, releaseBody, err := readBodyOptimized(resp.Body, resp.ContentLength)
+	if err != nil {
+		return nil, NewRequestError("read_body", host, port, proto, err)
+	}
+
+	if ce := resp.Header.Get("Content-Encoding"); ce != "" {
+		decompressed, err := decompress(body, ce)
+		if err != nil {
+			releaseBody()
+			return nil, NewRequestError("decompress", host, port, proto, err)
+		}
+		releaseBody()
+		body = decompressed
+		releaseBody = func() {}
+	}
+	_ = releaseBody // body now owned by the Response
+
+	timing.Total = float64(time.Since(startTime).Milliseconds())
+
+	return &Response{
+		StatusCode: resp.StatusCode,
+		Headers:    buildHeadersMap(resp.Header),
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		FinalURL:   req.URL,
+		Timing:     timing,
+		Protocol:   proto,
+		bodyBytes:  body,
+		bodyRead:   true,
+	}, nil
 }
