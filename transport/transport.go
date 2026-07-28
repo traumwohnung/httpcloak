@@ -7,8 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	http "github.com/sardanioss/http"
+	"io"
 	"net/url"
 	"strings"
 	"sync"
@@ -210,6 +210,12 @@ type Response struct {
 	Timing     *protocol.Timing
 	Protocol   string // "h1", "h2", or "h3"
 	History    []*RedirectInfo
+
+	// ContentLength is the length of Body in bytes, or -1 when unknown
+	// (chunked responses, and any body decompressed on the fly). Only set by
+	// the streaming entrypoints; the buffered ones leave it at 0 since their
+	// length is simply len(bodyBytes).
+	ContentLength int64
 
 	// bodyBytes caches the body after reading for multiple access
 	bodyBytes []byte
@@ -1251,14 +1257,15 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h1",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h1",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -1365,14 +1372,15 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   parsedURL.String(),
-		Timing:     timing,
-		Protocol:   "h1",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      parsedURL.String(),
+		Timing:        timing,
+		Protocol:      "h1",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -1501,14 +1509,15 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h2",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h2",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -1638,14 +1647,15 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	headers := buildHeadersMap(resp.Header)
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    headers,
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   "h3",
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:    resp.StatusCode,
+		Headers:       headers,
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      "h3",
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
 
@@ -2070,38 +2080,11 @@ func (t *Transport) doOnRoundTripper(ctx context.Context, req *Request, proto st
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	method := req.Method
-	if method == "" {
-		method = "GET"
-	}
-
-	var bodyReader io.Reader
-	if req.BodyReader != nil {
-		bodyReader = req.BodyReader
-	} else if len(req.Body) > 0 {
-		bodyReader = bytes.NewReader(req.Body)
-	} else if method == "POST" || method == "PUT" || method == "PATCH" {
-		bodyReader = bytes.NewReader([]byte{})
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, method, req.URL, bodyReader)
+	// Shared with doStreamOnRoundTripper so header order and preset
+	// application cannot drift between the buffered and streaming paths.
+	httpReq, err := t.prepareOwnedConnRequest(ctx, req, proto)
 	if err != nil {
 		return nil, NewRequestError("create_request", host, port, proto, err)
-	}
-
-	effectiveTLSOnly := t.tlsOnly
-	if req.TLSOnly != nil {
-		effectiveTLSOnly = *req.TLSOnly
-	}
-	applyPresetHeaders(httpReq, t.preset, t.getHeaderOrder(), t.getCustomPseudoOrder(), effectiveTLSOnly, proto, req.Headers)
-	for key, values := range req.Headers {
-		for i, value := range values {
-			if i == 0 {
-				httpReq.Header.Set(key, value)
-			} else {
-				httpReq.Header.Add(key, value)
-			}
-		}
 	}
 
 	reqStart := time.Now()
@@ -2132,13 +2115,14 @@ func (t *Transport) doOnRoundTripper(ctx context.Context, req *Request, proto st
 	timing.Total = float64(time.Since(startTime).Milliseconds())
 
 	return &Response{
-		StatusCode: resp.StatusCode,
-		Headers:    buildHeadersMap(resp.Header),
-		Body:       io.NopCloser(bytes.NewReader(body)),
-		FinalURL:   req.URL,
-		Timing:     timing,
-		Protocol:   proto,
-		bodyBytes:  body,
-		bodyRead:   true,
+		StatusCode:    resp.StatusCode,
+		Headers:       buildHeadersMap(resp.Header),
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		FinalURL:      req.URL,
+		Timing:        timing,
+		Protocol:      proto,
+		ContentLength: int64(len(body)),
+		bodyBytes:     body,
+		bodyRead:      true,
 	}, nil
 }
