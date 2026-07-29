@@ -163,6 +163,16 @@ func (t *Transport) prepareOwnedConnRequest(ctx context.Context, req *Request, p
 	if err != nil {
 		return nil, err
 	}
+	// An explicit length overrides Go's type-sniffing of bodyReader, so a
+	// streamed body can still be framed with a real Content-Length (or
+	// deliberately chunked with -1) instead of forcing the caller to buffer.
+	if req.BodyReader != nil && req.ContentLength != 0 {
+		httpReq.ContentLength = req.ContentLength
+		if req.ContentLength < 0 {
+			httpReq.ContentLength = -1
+			httpReq.TransferEncoding = []string{"chunked"}
+		}
+	}
 
 	effectiveTLSOnly := t.tlsOnly
 	if req.TLSOnly != nil {

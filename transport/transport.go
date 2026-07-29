@@ -186,6 +186,16 @@ type Request struct {
 	BodyReader io.Reader // For streaming uploads - used instead of Body if set
 	Timeout    time.Duration
 
+	// ContentLength is the length of BodyReader in bytes, or -1 when unknown
+	// (the request is then framed chunked). Leave at 0 with a nil BodyReader
+	// for a bodyless request.
+	//
+	// Without it, framing is inferred by type-asserting BodyReader for
+	// *bytes.Reader and friends, which forces a caller who wants a real
+	// Content-Length to buffer the whole body first. Setting it explicitly
+	// lets a proxy forward the client's own framing while streaming.
+	ContentLength int64
+
 	// TLSOnly is a per-request override for TLS-only mode.
 	// When set to true, preset HTTP headers are NOT applied - only TLS fingerprinting is used.
 	// When nil, the transport's TLSOnly setting is used.
